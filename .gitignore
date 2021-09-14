@@ -12,3 +12,7 @@ venv/
 crypto_trading.db
 apprise.yml
 .DS_Store
+.python-version
+*env*
+current_coin.sh
+all_coins.sh

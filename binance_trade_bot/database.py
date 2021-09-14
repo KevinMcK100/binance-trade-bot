@@ -3,14 +3,16 @@ import os
 import time
 from collections import namedtuple
 from contextlib import contextmanager
-from datetime import datetime, timedelta
+from datetime import datetime as _datetime
+from datetime import timedelta
 from typing import List, Optional, Union
 
 from socketio import Client
 from socketio.exceptions import ConnectionError as SocketIOConnectionError
-from sqlalchemy import create_engine, func, insert, select, update
+from sqlalchemy import create_engine, func, insert, select, update, Float
 from sqlalchemy.orm import Session, scoped_session, sessionmaker
 
+from .models.deposit import Deposit
 from .config import Config
 from .logger import Logger
 from .models import *  # pylint: disable=wildcard-import
@@ -150,10 +152,20 @@ class Database:
             session.expunge_all()
             return pairs
 
+    def set_deposit(self, usd_amount: Float, datetime: _datetime = None):
+        session: Session
+        with self.db_session() as session:
+            session.add(Deposit(usd_amount, datetime))
+
+    def get_deposits(self) -> List[Deposit]:
+        session: Session
+        with self.db_session() as session:
+            return session.query(Deposit).all()
+
     def batch_log_scout(self, logs: List[LogScout]):
         session: Session
         with self.db_session() as session:
-            dt = datetime.now()
+            dt = _datetime.now()
             session.execute(
                 insert(ScoutHistory),
                 [
@@ -183,7 +195,7 @@ class Database:
             self.send_update(sh)
 
     def prune_scout_history(self):
-        time_diff = datetime.now() - timedelta(hours=self.config.SCOUT_HISTORY_PRUNE_TIME)
+        time_diff = _datetime.now() - timedelta(hours=self.config.SCOUT_HISTORY_PRUNE_TIME)
         session: Session
         with self.db_session() as session:
             session.query(ScoutHistory).filter(ScoutHistory.datetime < time_diff).delete()
@@ -233,19 +245,19 @@ class Database:
 
             # The last 24 hours worth of minutely entries will be kept, so
             # count(coins) * 1440 entries
-            time_diff = datetime.now() - timedelta(hours=24)
+            time_diff = _datetime.now() - timedelta(hours=24)
             session.query(CoinValue).filter(
                 CoinValue.interval == Interval.MINUTELY, CoinValue.datetime < time_diff
             ).delete()
 
             # The last 28 days worth of hourly entries will be kept, so count(coins) * 672 entries
-            time_diff = datetime.now() - timedelta(days=28)
+            time_diff = _datetime.now() - timedelta(days=28)
             session.query(CoinValue).filter(
                 CoinValue.interval == Interval.HOURLY, CoinValue.datetime < time_diff
             ).delete()
 
             # The last years worth of daily entries will be kept, so count(coins) * 365 entries
-            time_diff = datetime.now() - timedelta(days=365)
+            time_diff = _datetime.now() - timedelta(days=365)
             session.query(CoinValue).filter(
                 CoinValue.interval == Interval.DAILY, CoinValue.datetime < time_diff
             ).delete()
