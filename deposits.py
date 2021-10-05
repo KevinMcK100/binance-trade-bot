@@ -19,7 +19,6 @@ def validate_datetime(date_str) -> _datetime:
     except ValueError:
         raise ValueError("Incorrect datetime format. Must match ISO8601 format YYYY-MM-DDThh:mm:ss")
 
-# main
 if __name__ == "__main__":
     db_path = "data/crypto_trading.db"
     found_amount = False
