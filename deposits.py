@@ -51,3 +51,4 @@ if __name__ == "__main__":
 
     deposit(amount, datetime, db_path)
     os._exit(OK())
+
