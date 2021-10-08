@@ -103,7 +103,7 @@ class MockBinanceManager(BinanceAPIManager):
             diff_str = f"{diff} %"
 
         self.logger.info(
-            f"{self.datetime} Bought {origin_symbol} {round(self.balances[origin_symbol], 4)} for {from_coin_price} {target_symbol}. Gain: {diff_str}"
+            f"{self.datetime} Bought {origin_symbol} {round(self.balances[origin_symbol], 4)} for {from_coin_price} {target_symbol}. Total {round(self.balances[origin_symbol], 4) * from_coin_price} {target_symbol}. Gain: {diff_str}"
         )
         
         if diff is not None:
@@ -189,7 +189,7 @@ class MockBinanceManager(BinanceAPIManager):
 
 class MockDatabase(Database):
     def __init__(self, logger: Logger, config: Config):
-        super().__init__(logger, config, "sqlite:///", True)
+        super().__init__(logger, config, "sqlite:///data/crypto_trading.db.basktest", False)
 
     def log_scout(self, pair: Pair, target_ratio: float, current_coin_price: float, other_coin_price: float):
         pass

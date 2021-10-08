@@ -26,9 +26,9 @@ class Strategy(AutoTrader):
             if coin_price is None:
                 self.logger.info("Skipping scouting... current coin {} not found".format(coin + self.config.BRIDGE))
                 continue
-            
+
             if self.config.ALLOW_COIN_MERGE == False:
-                #fetch active coin again to avoid some coins fusioning by jumping to the same coin in the same scout run
+                # fetch active coin again to avoid some coins fusioning by jumping to the same coin in the same scout run
                 current_active_coins = self.get_active_coins()
                 excluded_coins = current_active_coins
 
@@ -40,7 +40,8 @@ class Strategy(AutoTrader):
 
         # no active coin left. buy one.
         if len(active_coins) == 0:
-            self.logger.info("No active coin found. Going to buy one. If you want to have more than one coin you just need to buy coins from your coinlist.")
+            self.logger.info(
+                "No active coin found. Going to buy one. If you want to have more than one coin you just need to buy coins from your coinlist.")
             self.bridge_scout()
 
     def get_active_coins(self):
@@ -53,7 +54,7 @@ class Strategy(AutoTrader):
             if coin_price is None:
                 self.logger.info("Skipping scouting... coin {} not found".format(coin + self.config.BRIDGE))
                 continue
-            
+
             min_notional = self.manager.get_min_notional(coin.symbol, self.config.BRIDGE.symbol)
             if coin_price * current_coin_balance > min_notional:
                 active_coins.append(coin)
@@ -69,7 +70,7 @@ class Strategy(AutoTrader):
         active_coins = self.get_active_coins()
         active_coin_symbols = [c.symbol for c in active_coins]
         for coin in self.db.get_coins():
-            #skip active coins, we dont want coin fusion
+            # skip active coins, we dont want coin fusion
             if self.config.ALLOW_COIN_MERGE == False and coin.symbol in active_coin_symbols:
                 continue
 
