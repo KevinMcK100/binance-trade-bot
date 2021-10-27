@@ -1,9 +1,10 @@
-from datetime import datetime, timezone
 import json
 import math
 import os
 import time
 import traceback
+import random, string
+from datetime import datetime, timezone
 from abc import ABC, abstractmethod
 from collections import defaultdict
 from typing import Callable, Dict, Optional
@@ -19,8 +20,15 @@ from .database import Database
 from .logger import Logger
 from .models import Coin
 
+
 def float_as_decimal_str(num: float):
     return f"{num:0.08f}".rstrip("0").rstrip(".")  # remove trailing zeroes too
+
+
+def generate_client_order_id() -> str:
+    rand = ''.join(random.choices(string.ascii_letters + string.digits, k=16))
+    return f"btb_{rand}"
+
 
 class AbstractOrderBalanceManager(ABC):
     @abstractmethod
@@ -37,13 +45,15 @@ class AbstractOrderBalanceManager(ABC):
         symbol: str, 
         quantity: float,
         quote_quantity: float,
-        price: float
+        price: float,
+        client_order_id: str,
     ):
         params = {
             "symbol": symbol,
             "side": side,
             "quantity": float_as_decimal_str(quantity),
             "type": Client.ORDER_TYPE_MARKET,
+            "newClientOrderId": client_order_id,
         }
         if side == Client.SIDE_BUY:
             del params["quantity"]
@@ -64,12 +74,14 @@ class BinanceOrderBalanceManager(AbstractOrderBalanceManager):
         quantity: float,
         price: float,
         quote_quantity: float,
+        client_order_id: str,
     ):
         params = {
             "symbol": symbol,
             "side": side,
             "quantity": float_as_decimal_str(quantity),
             "type": self.config.BUY_ORDER_TYPE if side == Client.SIDE_BUY else self.config.SELL_ORDER_TYPE,
+            "newClientOrderId": client_order_id,
         }
         if params["type"] == Client.ORDER_TYPE_LIMIT:
             params["timeInForce"] = self.binance_client.TIME_IN_FORCE_GTC
@@ -103,6 +115,7 @@ class BinanceOrderBalanceManager(AbstractOrderBalanceManager):
                 return cache_balances.get(currency_symbol, 0.0)
 
             return balance
+
 
 class BinanceAPIManager:
     def __init__(
@@ -491,7 +504,12 @@ class BinanceAPIManager:
         if from_coin_price > buy_price * (1.0 + buy_max_price_change):
             self.logger.info("Buy price became higher, cancel buy")
             return None
+
+        # Check if we're merging onto an active coin
+
+
         #from_coin_price = min(buy_price, from_coin_price)
+
         trade_log = self.db.start_trade_log(origin_coin, target_coin, False)
 
         if buy_quantity is None:
@@ -511,6 +529,7 @@ class BinanceAPIManager:
                     quantity=order_quantity,
                     quote_quantity=target_balance,
                     price=from_coin_price,
+                    client_order_id=generate_client_order_id(),
                 )
                 self.logger.info(order, False)
             except BinanceAPIException as e:
@@ -567,6 +586,15 @@ class BinanceAPIManager:
             return None  # skip selling below price from ratio
         #from_coin_price = max(from_coin_price, sell_price)
 
+        # If there is some bridge coin present when selling, assume it's a manual deposit.
+        trans_id = origin_symbol + target_symbol + str(target_balance)
+        min_notional = self.get_min_notional(origin_symbol, target_symbol)
+        if target_balance > min_notional and not self.cache.transactions[trans_id]:
+            self.db.set_manual_transaction("", target_symbol, target_balance, 1, True)
+            # Indicates this deposit has been recorded to avoid double counting in the event of retries
+            self.cache.transactions[trans_id] = True
+            # Update PNLs to reflect deposited amount
+
         trade_log = self.db.start_trade_log(origin_coin, target_coin, True)
 
         order_quantity = self._sell_quantity(origin_symbol, target_symbol, origin_balance)
@@ -583,6 +611,7 @@ class BinanceAPIManager:
                     quantity=order_quantity,
                     quote_quantity=from_coin_price * order_quantity,
                     price=from_coin_price,
+                    client_order_id=generate_client_order_id(),
                 )
                 self.logger.info(order, False)
             except BinanceAPIException as e:
@@ -611,6 +640,34 @@ class BinanceAPIManager:
         trade_log.set_complete(order.cumulative_quote_qty)
 
         return order
+
+    def monitor_manual_transactions(self):
+
+        for order_id, already_processed in self.cache.transactions.items():
+            if not already_processed:
+                order = self.cache.orders[order_id]
+                self.logger.info(f"Value: {order}")
+                base_asset = self.binance_client.get_symbol_info(order.symbol)["baseAsset"]
+                self.logger.info(f"Base asset: {base_asset}")
+                if base_asset in self.config.SUPPORTED_COIN_LIST:
+                    self.logger.info("Origin symbol is in supported coin list")
+                    if order.status == Client.ORDER_STATUS_FILLED:
+                        self.logger.info("New transaction found")
+                        quantity = order.cumulative_filled_quantity
+                        price = order.cumulative_quote_qty
+                        coin = Coin(base_asset)
+                        deposited = False
+                        if order.side == Client.SIDE_BUY:
+                            self.logger.info("Amount deposited.")
+                            deposited = True
+                        else:
+                            self.logger.info("Amount withdrew.")
+                        self.db.set_manual_transaction(order.id, coin, quantity, price, deposited)
+                        self.logger.info(
+                            f"Symbol: {base_asset}, Quantity: {quantity}, Price: {price}, Client Order ID: {order.client_order_id}")
+                # Indicates this deposit/withdrawal has been persisted to DB and should not be processed again
+                self.cache.transactions[order_id] = True
+
 
 class PaperOrderBalanceManager(AbstractOrderBalanceManager):
     PERSIST_FILE_PATH = "data/paper_wallet.json"
@@ -660,7 +717,8 @@ class PaperOrderBalanceManager(AbstractOrderBalanceManager):
         symbol: str, 
         quantity: float,
         quote_quantity: float,
-        price: float
+        price: float,
+        client_order_id: str,
     ):
         symbol_base = symbol[: -len(self.bridge)]
         if side == Client.SIDE_SELL:
@@ -672,7 +730,8 @@ class PaperOrderBalanceManager(AbstractOrderBalanceManager):
             self.balances[self.bridge] = self.get_currency_balance(self.bridge) - quote_quantity
             self.balances[symbol_base] = self.get_currency_balance(symbol_base) + quantity * (1 - fees)
         self.cache.balances_changed_event.set()
-        super().make_order(side, symbol, quantity, quote_quantity, price)
+        client_order_id = generate_client_order_id()
+        super().make_order(side, symbol, quantity, quote_quantity, price, client_order_id)
         if side == Client.SIDE_BUY:
             # we do it only after buy for transaction speed
             # probably should be a better idea to make it a postponed call
@@ -691,6 +750,7 @@ class PaperOrderBalanceManager(AbstractOrderBalanceManager):
                 order_price=str(price),
                 side=side,
                 type=Client.ORDER_TYPE_MARKET,
+                client_order_id=client_order_id,
             )
         )
         self.cache.orders[str(self.fake_order_id)] = forder
@@ -704,4 +764,5 @@ class PaperOrderBalanceManager(AbstractOrderBalanceManager):
             price=str(price),
             side=side,
             type=Client.ORDER_TYPE_MARKET,
+            client_order_id=client_order_id,
         )

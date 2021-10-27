@@ -16,7 +16,7 @@ def main():
     config = Config()
     db = Database(logger, config)
     if config.ENABLE_PAPER_TRADING:
-        manager = BinanceAPIManager.create_manager_paper_trading(config, db, logger, {config.BRIDGE.symbol: 21_000.0})
+        manager = BinanceAPIManager.create_manager_paper_trading(config, db, logger, {config.BRIDGE.symbol: 188.0})
     else:
         manager = BinanceAPIManager.create_manager(config, db, logger)
 
@@ -53,6 +53,7 @@ def main():
 
     db.set_coins(config.SUPPORTED_COIN_LIST)
     db.migrate_old_state()
+    db.mirgate_multiple_coin_pnl()
 
     trader.initialize()
 

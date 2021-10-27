@@ -13,6 +13,7 @@ from unicorn_binance_websocket_api import BinanceWebSocketApiManager
 from .config import Config
 from .logger import Logger
 
+
 class ThreadSafeAsyncLock:
     def __init__(self):
         self._init_lock = threading.Lock()
@@ -46,6 +47,7 @@ class ThreadSafeAsyncLock:
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         await self._async_lock.__aexit__(exc_type, exc_val, exc_tb)
 
+
 class BinanceOrder:  # pylint: disable=too-few-public-methods
     def __init__(self, report):
         self.event = report
@@ -58,6 +60,7 @@ class BinanceOrder:  # pylint: disable=too-few-public-methods
         self.price = float(report["order_price"])
         self.time = report["transaction_time"]
         self.cumulative_filled_quantity = float(report["cumulative_filled_quantity"])
+        self.client_order_id = str(report["client_order_id"])
 
     def __repr__(self):
         return f"<BinanceOrder {self.event}>"
@@ -73,6 +76,7 @@ class BinanceCache:  # pylint: disable=too-few-public-methods
         self.non_existent_tickers: Set[str] = set()
         self.balances_changed_event = threading.Event()
         self.orders: Dict[str, BinanceOrder] = {}
+        self.transactions: Dict[str, bool] = {}
 
     def attach_loop(self):
         self._balances_mutex.attach_loop()
@@ -89,7 +93,7 @@ class BinanceCache:  # pylint: disable=too-few-public-methods
 
 
 class OrderGuard:
-    def __init__(self, pending_orders: Set[Tuple[str, int]], mutex: threading.Lock):
+    def __init__(self, pending_orders: Set[Tuple[str, str]], mutex: threading.Lock):
         self.pending_orders = pending_orders
         self.mutex = mutex
         # lock immediately because OrderGuard
@@ -97,7 +101,7 @@ class OrderGuard:
         self.mutex.acquire()
         self.tag = None
 
-    def set_order(self, origin_symbol: str, target_symbol: str, order_id: int):
+    def set_order(self, origin_symbol: str, target_symbol: str, order_id: str):
         self.tag = (origin_symbol + target_symbol, order_id)
 
     def __enter__(self):
@@ -140,7 +144,7 @@ class BinanceStreamManager:
             )
             
         self.binance_client = binance_client
-        self.pending_orders: Set[Tuple[str, int]] = set()
+        self.pending_orders: Set[Tuple[str, str]] = set()
         self.pending_orders_mutex: threading.Lock = threading.Lock()
         self._processorThread = threading.Thread(target=self._stream_processor)
         self._processorThread.start()
@@ -149,7 +153,7 @@ class BinanceStreamManager:
         return OrderGuard(self.pending_orders, self.pending_orders_mutex)
 
     def _fetch_pending_orders(self):
-        pending_orders: Set[Tuple[str, int]]
+        pending_orders: Set[Tuple[str, str]]
         with self.pending_orders_mutex:
             pending_orders = self.pending_orders.copy()
         for (symbol, order_id) in pending_orders:
@@ -205,9 +209,15 @@ class BinanceStreamManager:
     def _process_stream_data(self, stream_data):
         event_type = stream_data["event_type"]
         if event_type == "executionReport":  # !userData
-            self.logger.debug(f"execution report: {stream_data}")
+            self.logger.info(f"execution report: {stream_data}")
             order = BinanceOrder(stream_data)
             self.cache.orders[order.id] = order
+            # assess for manual transaction
+            if not str(order.client_order_id).startswith("btb_") and not self.cache.transactions[order.id]:
+                self.logger.info("Setting transaction")
+                # Indicates that this order should be processed as a manual deposit/withdrawal transaction
+                self.cache.transactions[order.id] = False
+                self.logger.info(f"Set transactions. New size: {len(self.cache.transactions)}")
         elif event_type == "balanceUpdate":  # !userData
             self.logger.debug(f"Balance update: {stream_data}")
             with self.cache.open_balances() as balances:

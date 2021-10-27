@@ -1,6 +1,6 @@
 from collections import defaultdict
 from datetime import datetime
-from typing import Dict, List
+from typing import Dict, List, Optional, Union
 
 from sqlalchemy.orm import Session
 
@@ -8,7 +8,7 @@ from .binance_api_manager import BinanceAPIManager
 from .config import Config
 from .database import Database, LogScout
 from .logger import Logger
-from .models import Coin, CoinValue, Pair
+from .models import Coin, CoinValue, Pair, Path, CoinPnl
 
 
 class AutoTrader:
@@ -18,6 +18,7 @@ class AutoTrader:
         self.logger = logger
         self.config = config
         self.failed_buy_order = False
+        self.failed_buy_path = None
 
     def initialize(self):
         self.initialize_trade_thresholds()
@@ -40,20 +41,112 @@ class AutoTrader:
             self.logger.info("Couldn't sell, going back to scouting mode...")
             return None
 
+        path = self.get_coin_path(pair.from_coin)
+
+        # temporary force fail to test PNL
+        self.logger.info(f"Log timestamp for testing: {self.manager.datetime}")
+        if self.manager.datetime == datetime(2021, 10, 6, 16, 1, 0):
+            self.logger.info("Fake failure")
+            self.failed_buy_order = True
+            self.failed_buy_path = path
+            return None
+
         result = self.manager.buy_alt(pair.to_coin, self.config.BRIDGE, buy_price)
+
         if result is not None:
-            self.db.set_current_coin(pair.to_coin)
-            price = result.price
-            if abs(price) < 1e-15:
-                price = result.cumulative_quote_qty / result.cumulative_filled_quantity
+            price = self.get_price(result)
+            is_merging = self.is_paths_merging(pair.to_coin)
+            if is_merging:
+                self.logger.info(f"Merging paths for {pair.from_coin} and {pair.to_coin}")
+                path = self.merge_paths(pair.from_coin, pair.to_coin, result, price)
+                self.logger.info(f"Merged paths into new path {path}")
+            else:
+                coin_pnl = self.set_coin_pnl(pair.to_coin, path, result.cumulative_filled_quantity, price)
+                self.logger.info(f"New coin PNL: {coin_pnl.info()}")
+
+            self.db.set_current_coin(pair.to_coin, path)
 
             self.update_trade_threshold(pair.to_coin, price)
             self.failed_buy_order = False
+            self.failed_buy_path = None
             return result
 
         self.logger.info("Couldn't buy, going back to scouting mode...")
         self.failed_buy_order = True
+        self.failed_buy_path = path
         return None
+
+    def get_price(self, result):
+        if abs(result.price) < 1e-15:
+            return result.cumulative_quote_qty / result.cumulative_filled_quantity
+        return result.price
+
+    def set_coin_pnl(self, coin: Coin, path: Path, quantity: float, price: float) -> CoinPnl:
+        coin_gain, percent_gain, total_coin_gain, total_percent_gain = 0.0, 0.0, 0.0, 0.0
+        previous_coin_pnl = self.db.get_last_coin_pnl(coin, path)
+        if previous_coin_pnl is not None:
+            coin_gain = quantity - previous_coin_pnl.coin_amount
+            percent_gain = coin_gain / previous_coin_pnl.coin_amount * 100
+            total_coin_gain = previous_coin_pnl.total_coin_gain + coin_gain
+            total_percent_gain = previous_coin_pnl.total_percent_gain + percent_gain
+
+        return self.db.set_coin_pnl(path, coin, quantity, price, coin_gain, percent_gain, total_coin_gain, total_percent_gain)
+
+    def set_deposited_coin_pnl(self, coin: Coin, path: Path, quantity: float, price: float) -> CoinPnl:
+        coin_gain, percent_gain, total_coin_gain, total_percent_gain = 0.0, 0.0, 0.0, 0.0
+        previous_coin_pnl = self.db.get_last_coin_pnl(coin, path)
+        if previous_coin_pnl is not None:
+            quantity = previous_coin_pnl.coin_amount + quantity
+            coin_gain = previous_coin_pnl.coin_gain
+            percent_gain = previous_coin_pnl.percent_gain
+            total_coin_gain = previous_coin_pnl.total_coin_gain
+            total_percent_gain = previous_coin_pnl.total_percent_gain
+
+        return self.db.set_coin_pnl(path, coin, quantity, price, coin_gain, percent_gain, total_coin_gain, total_percent_gain)
+
+    def merge_coin_pnl(self, to_coin: Coin, path_a: Path, path_b: Path, new_path: Path, quantity: float, price: float) -> CoinPnl:
+        coin_gain, percent_gain, total_coin_gain, total_percent_gain = 0.0, 0.0, 0.0, 0.0
+        old_path_coin_pnl = self.db.get_last_coin_pnl(to_coin, path_a)
+        new_path_coin_pnl = self.db.get_last_coin_pnl(to_coin, path_b)
+        self.logger.info(f"Will attempt to merge coin paths for coin PNL")
+        if old_path_coin_pnl is not None and new_path_coin_pnl is not None:
+            self.logger.info(f"Merging coin PNL {old_path_coin_pnl.info()} into {new_path_coin_pnl.info()}")
+            cum_old_quantity = old_path_coin_pnl.coin_amount + new_path_coin_pnl.coin_amount
+            coin_gain = quantity - cum_old_quantity
+            percent_gain = coin_gain / cum_old_quantity * 100
+            total_coin_gain = new_path_coin_pnl.total_coin_gain + coin_gain
+            total_percent_gain = new_path_coin_pnl.total_percent_gain + percent_gain
+
+        return self.db.set_coin_pnl(new_path, to_coin, quantity, price, coin_gain, percent_gain, total_coin_gain, total_percent_gain)
+
+    def get_path(self, path: Union[Coin, Path]):
+        if isinstance(path, Path):
+            return path
+        return self.db.get_coin_path(path)
+
+    def merge_paths(self, merge_from: Union[Coin, Path], merge_to: Union[Coin, Path], result, price) -> Optional[Path]:
+        path_a = self.get_path(merge_from)
+        path_b = self.get_path(merge_to)
+        new_path = self.db.set_new_coin_path()
+        if path_a is None or path_b is None:
+            self.logger.error("Failed to merge paths. Path ID to merge could not be fetched from DB.")
+            return None
+        coin_pnl = self.merge_coin_pnl(merge_to, path_a, path_b, new_path, result.cumulative_filled_quantity, price)
+        self.logger.info(f"Merged coin PNL: {coin_pnl.info()}")
+        self.db.deactivate_path(path_a)
+        self.db.deactivate_path(path_b)
+        return new_path
+
+    def is_paths_merging(self, to_coin: Coin):
+        active_coins = self.db.get_active_coins()
+        return to_coin.symbol in active_coins
+
+    def get_coin_path(self, from_coin: Coin) -> Path:
+        path = self.db.get_coin_path(from_coin)
+        # Check if we need to create new path
+        if path is None:
+            return self.db.set_new_coin_path()
+        return path
 
     def update_trade_threshold(self, coin: Coin, coin_price: float):
         """
@@ -217,3 +310,54 @@ class AutoTrader:
             cv = CoinValue(coin, balance, usd_value, btc_value, datetime=now)
             cv_batch.append(cv)
         self.db.batch_update_coin_values(cv_batch)
+
+    def handle_manual_transactions(self, transactions: List[Dict], exchange_active_coins=None, bot_active_coins=None):
+        if exchange_active_coins is None:
+            exchange_active_coins = []
+        if bot_active_coins is None:
+            bot_active_coins = []
+
+        # Coins deposited on exchange but not yet activated on the bot
+        new_coins = [x for x in exchange_active_coins if x not in bot_active_coins]
+
+        # Coins withdrawn on exchange not yet deactivated on the bot
+        removed_coins = [x for x in bot_active_coins if x not in exchange_active_coins]
+
+        for transaction in transactions:
+            print(f"Handling transaction: {transaction}")
+            coin = Coin(transaction.get("symbol"))
+            tx_quantity = float(transaction.get("cum_quantity"))
+            tx_coin_price = float(transaction.get("coin_price"))
+            deposit = bool(transaction.get("deposit"))
+            self.db.set_manual_transaction(coin, tx_quantity, tx_coin_price, deposit)
+
+            if coin.symbol in new_coins and deposit:
+                # Activate coin on bot and create new PNL records
+                new_path = self.db.set_new_coin_path()
+                if new_path is None:
+                    self.logger.warning(f"Failed to activate new path for deposit/withdrawal. Coin: {coin.symbol}")
+                    continue
+                self.logger.info(f"Activating new path {new_path.id} for deposited amount {tx_quantity} on {coin}")
+                self.db.set_current_coin(coin, new_path)
+                new_pnl = self.set_deposited_coin_pnl(coin, new_path, tx_quantity, tx_coin_price)
+                self.logger.info(f"Successfully updated coin PNL quantity to {new_pnl.coin_amount} for coin {new_pnl.coin.symbol} on path {new_pnl.path.id}")
+            elif coin.symbol in removed_coins and not deposit:
+                # Deactivate coin on bot
+                old_path = self.db.get_coin_path(coin)
+                if old_path is None:
+                    self.logger.warning(f"Failed to retrieve old path from DB for deposit/withdrawal. Coin: {coin.symbol}")
+                    continue
+                self.logger.info(f"Deactivating old path {old_path.id} for deposited amount {tx_quantity} on {coin}")
+                self.db.deactivate_path(old_path)
+            elif coin.symbol in exchange_active_coins and coin.symbol in bot_active_coins:
+                # Deposit or withdrawal on already active coin so we just need to adjust PNLs to new quantity
+                quantity = tx_quantity if deposit else - tx_quantity
+                coin_path = self.db.get_coin_path(coin)
+                if coin_path is None:
+                    self.logger.warning(f"Failed to retrieve path from DB when attempting to update Coin PNL for deposit/withdrawal. Coin: {coin.symbol}")
+                    continue
+                updated_pnl = self.set_deposited_coin_pnl(coin, coin_path, quantity, tx_coin_price)
+                if updated_pnl is None:
+                    self.logger.warning(f"Failed to update PNL record for deposit/withdrawal. Coin: {coin.symbol} Path: {coin_path.id}")
+                    continue
+                self.logger.info(f"Successfully updated coin PNL quantity to {updated_pnl.coin_amount} for coin {updated_pnl.coin.symbol} on path {updated_pnl.path.id}")

@@ -9,8 +9,11 @@ from typing import List, Optional, Union
 
 from socketio import Client
 from socketio.exceptions import ConnectionError as SocketIOConnectionError
-from sqlalchemy import create_engine, func, insert, select, update, Float
-from sqlalchemy.orm import Session, scoped_session, sessionmaker
+from sqlalchemy import create_engine, func, insert, select, update, Float, Integer, String
+from sqlalchemy.orm import Session, scoped_session, sessionmaker, column_property
+from sqlalchemy import engine_from_config
+from sqlalchemy.engine import reflection
+
 
 from .models.deposit import Deposit
 from .config import Config
@@ -102,13 +105,16 @@ class Database:
             session.expunge(coin)
             return coin
 
-    def set_current_coin(self, coin: Union[Coin, str]):
+    def set_current_coin(self, coin: Union[Coin, str], path: Path = None):
         coin = self.get_coin(coin)
+        if path is None:
+            path = self.set_new_coin_path()
         session: Session
         with self.db_session() as session:
             if isinstance(coin, Coin):
                 coin = session.merge(coin)
-            cc = CurrentCoin(coin)
+            path = session.merge(path)
+            cc = CurrentCoin(coin, path)
             session.add(cc)
             self.send_update(cc)
 
@@ -121,6 +127,52 @@ class Database:
             coin = current_coin.coin
             session.expunge(coin)
             return coin
+
+    def get_coin_path(self, coin: Union[Coin, str]) -> Optional[Path]:
+        coin = self.get_coin(coin)
+        session: Session
+        with self.db_session() as session:
+            current_coin = session.query(CurrentCoin).filter(CurrentCoin.coin == coin).order_by(CurrentCoin.datetime.desc()).first()
+            if current_coin is None:
+                return None
+            path = current_coin.path
+            session.expunge_all()
+            return path
+
+    def set_new_coin_path(self) -> Path:
+        session: Session
+        with self.db_session() as session:
+            path = Path(True)
+            session.add(path)
+            # Flush so that SQLAlchemy fills in the id column
+            session.flush()
+            self.send_update(path)
+            session.expunge_all()
+            return path
+
+    def deactivate_path(self, path: Path):
+        session: Session
+        with self.db_session() as session:
+            updated_path: Trade = session.merge(path)
+            updated_path.active = False
+            self.send_update(updated_path)
+
+    def get_active_coins(self) -> List[String]:
+        session: Session
+        with self.db_session() as session:
+            active_paths = session.query(Path).filter(Path.active).all()
+            active_path_ids = [path.id for path in active_paths]
+            max_active = [x[0] for x in session.query(func.max(CurrentCoin.id)).group_by(CurrentCoin.path_id).all()]
+            active_coins = session.query(CurrentCoin.coin_id).filter(CurrentCoin.path_id.in_(active_path_ids), CurrentCoin.id.in_(max_active)).all()
+            session.expunge_all()
+            return [x[0] for x in active_coins]
+
+    def get_active_paths(self) -> List[Path]:
+        session: Session
+        with self.db_session() as session:
+            active_paths = session.query(Path).filter(Path.active).all()
+            session.commit()
+            return active_paths
 
     def get_pair(self, from_coin: Union[Coin, str], to_coin: Union[Coin, str]):
         from_coin = self.get_coin(from_coin)
@@ -151,6 +203,40 @@ class Database:
             pairs = pairs.all()
             session.expunge_all()
             return pairs
+
+    # Coin PNL
+
+    def get_last_coin_pnl(self, coin: Union[Coin, str], path: Path) -> Optional[CoinPnl]:
+        coin = self.get_coin(coin)
+        session: Session
+        with self.db_session() as session:
+            pnl = session.query(CoinPnl).filter(CoinPnl.coin == coin, CoinPnl.path_id == path.id).order_by(CoinPnl.id.desc()).first()
+            if pnl is None:
+                return None
+            session.expunge_all()
+            return pnl
+
+    def set_coin_pnl(self, path: Path, coin: Union[Coin, str], coin_amt: float, coin_price: float, coin_gain: float, percent_gain: float, total_coin_gain: float, total_percent_gain: float) -> CoinPnl:
+        coin = self.get_coin(coin)
+        session: Session
+        with self.db_session() as session:
+            path = session.merge(path)
+            coin = session.merge(coin)
+            pnl = CoinPnl(path, coin, coin_amt, coin_price, coin_gain, percent_gain, total_coin_gain, total_percent_gain)
+            session.add(pnl)
+            # Flush so that SQLAlchemy fills in the id column
+            session.flush()
+            self.send_update(pnl)
+            session.expunge_all()
+            return pnl
+
+    def update_coin_pnl_amt(self, coin_pnl: CoinPnl, coin_amt: float) -> CoinPnl:
+        session: Session
+        with self.db_session() as session:
+            updated_pnl: CoinPnl = session.merge(coin_pnl)
+            updated_pnl.coin_amount = coin_amt
+            self.send_update(updated_pnl)
+            return updated_pnl
 
     def set_deposit(self, usd_amount: Float, datetime: _datetime = None):
         session: Session
@@ -310,6 +396,22 @@ class Database:
             os.rename(".current_coin_table", ".current_coin_table.old")
             self.logger.info(".current_coin_table renamed to .current_coin_table.old - " "You can now delete this file")
 
+    def mirgate_multiple_coin_pnl(self):
+        session: Session
+        with self.db_session() as session:
+            try:
+                session.query(CurrentCoin).first()
+            except Exception:
+                session.execute('ALTER TABLE current_coin_history ADD COLUMN path_id INTEGER')
+                # initial_path = Path(True)
+                # stmt = (
+                #     update(CurrentCoin).
+                #     where(CurrentCoin.path_id is None).
+                #     values(path_id=initial_path.id)
+                # )
+                # session.execute(stmt)
+                session.commit()
+
     def batch_update_coin_values(self, cv_batch: List[CoinValue]):
         session: Session
         with self.db_session() as session:
@@ -327,6 +429,35 @@ class Database:
                     for cv in cv_batch
                 ],
             )
+
+    def get_all_manual_transactions(self) -> List[Transaction]:
+        session: Session
+        with self.db_session() as session:
+            tx = session.query(Transaction)
+            tx = tx.all()
+            session.expunge_all()
+            return tx
+
+    def set_manual_transaction(self, coin: Coin, coin_amount: float, usd_price: float, deposit: bool):
+        session: Session
+        with self.db_session() as session:
+            coin = session.merge(coin)
+            tx = Transaction(coin, coin_amount, usd_price, deposit)
+            session.add(tx)
+            self.send_update(tx)
+
+    # def get_current_trade(self, to_coin: Union[Coin, str]) -> Trade:
+    #     session: Session
+    #     with self.db_session() as session:
+    #         trade = session.query(Trade).filter(Trade.alt_coin == to_coin, Trade.selling == 0).order_by(Trade.datetime.desc()).first()
+    #         session.expunge_all()
+    #         return trade
+    #
+    # def update_trade(self, trade: Trade):
+    #     session: Session
+    #     with self.db_session() as session:
+    #         merged_trade = session.merge(trade)
+    #         self.send_update(merged_trade)
 
 
 class TradeLog:

@@ -8,19 +8,26 @@ class Strategy(AutoTrader):
         """
         Scout for potential jumps from the current coin to another coin
         """
-        active_coins = self.get_active_coins()
+        transactions = self.manager.monitor_manual_transactions()
+        exchange_active_coins = self.get_active_coins()
+
+        exchange_active_coins_sym = sorted([c.symbol for c in exchange_active_coins])
+        bot_active_coins = sorted(self.db.get_active_coins())
+
+        if transactions or (exchange_active_coins_sym != bot_active_coins):
+            self.handle_manual_transactions(transactions, exchange_active_coins_sym, bot_active_coins)
 
         # Display on the console, the current coin+Bridge, so users can see *some* activity and not think the bot
         # has stopped. Not logging though to reduce log size.
         print(
             f"{self.manager.now()} - CONSOLE - INFO - I am scouting the best trades. "
-            f"Current coins: {active_coins} ",
+            f"Current coins: {exchange_active_coins} ",
             end="\r",
         )
 
         excluded_coins = []
 
-        for coin in active_coins:
+        for coin in exchange_active_coins:
             coin_price = self.manager.get_sell_price(coin + self.config.BRIDGE)
 
             if coin_price is None:
@@ -39,7 +46,7 @@ class Strategy(AutoTrader):
                 self.bridge_scout()
 
         # no active coin left. buy one.
-        if len(active_coins) == 0:
+        if len(exchange_active_coins) == 0:
             self.logger.info(
                 "No active coin found. Going to buy one. If you want to have more than one coin you just need to buy coins from your coinlist.")
             self.bridge_scout()
@@ -71,7 +78,7 @@ class Strategy(AutoTrader):
         active_coin_symbols = [c.symbol for c in active_coins]
         for coin in self.db.get_coins():
             # skip active coins, we dont want coin fusion
-            if self.config.ALLOW_COIN_MERGE == False and coin.symbol in active_coin_symbols:
+            if not self.config.ALLOW_COIN_MERGE and coin.symbol in active_coin_symbols:
                 continue
 
             current_coin_price = self.manager.get_sell_price(coin + self.config.BRIDGE)
@@ -88,8 +95,27 @@ class Strategy(AutoTrader):
                         coin, self.config.BRIDGE, self.manager.get_sell_price(coin + self.config.BRIDGE)
                     )
                     if result is not None:
-                        self.db.set_current_coin(coin)
+
+                        if coin.symbol in active_coin_symbols:
+                            # update pnl for coin
+                            from_path = self.failed_buy_path
+                            to_coin = coin
+                            price = self.manager.get_price(result)
+                            path = self.manager.merge_paths(from_path, to_coin, result, price)
+                            # self.db.deactivate_path(old_path)
+                            # coin_pnl = self.db.get_last_coin_pnl(coin, old_path)
+                            # quantity = coin_pnl.coin_amount + result.cumulative_filled_quantity
+                            # coin_gain = coin_pnl.coin_gain
+                            # percent_gain = coin_pnl.percent_gain
+                            # total_coin_gain = coin_pnl.total_coin_gain
+                            # total_percent_gain = coin_pnl.total_percent_gain
+                        else:
+                            path = self.failed_buy_path
+                            self.set_coin_pnl(coin, self.failed_buy_path, result.cumulative_filled_quantity, self.get_price(result))
+
+                        self.db.set_current_coin(coin, path)
                         self.failed_buy_order = False
+                        self.failed_buy_path = None
                         return coin
                     else:
                         self.failed_buy_order = True

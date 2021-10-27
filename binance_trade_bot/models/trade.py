@@ -6,6 +6,7 @@ from sqlalchemy.orm import relationship
 
 from .base import Base
 from .coin import Coin
+from .path import Path
 
 
 class TradeState(enum.Enum):
@@ -34,6 +35,9 @@ class Trade(Base):  # pylint: disable=too-few-public-methods
     crypto_starting_balance = Column(Float)
     crypto_trade_amount = Column(Float)
 
+    path_id = Column(Integer, ForeignKey("paths.id"))
+    path = relationship("Path", foreign_keys=[path_id], lazy="joined")
+
     datetime = Column(DateTime)
 
     def __init__(self, alt_coin: Coin, crypto_coin: Coin, selling: bool):
@@ -54,5 +58,6 @@ class Trade(Base):  # pylint: disable=too-few-public-methods
             "alt_trade_amount": self.alt_trade_amount,
             "crypto_starting_balance": self.crypto_starting_balance,
             "crypto_trade_amount": self.crypto_trade_amount,
+            "path": self.path,
             "datetime": self.datetime.isoformat(),
         }

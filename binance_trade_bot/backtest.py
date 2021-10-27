@@ -9,10 +9,11 @@ from .binance_api_manager import BinanceAPIManager, BinanceOrderBalanceManager
 from .binance_stream_manager import BinanceCache, BinanceOrder
 from .historic_kline_cache import HistoricKlineCache
 from .config import Config
-from .database import Database
+from .database import Database, Path
 from .logger import Logger
 from .models import Coin, Pair, Trade, TradeState
 from .strategies import get_strategy
+from .mock_transaction import MockTransaction
 
 class MockBinanceManager(BinanceAPIManager):
     def __init__(
@@ -24,6 +25,7 @@ class MockBinanceManager(BinanceAPIManager):
             logger: Logger,
             start_date: datetime = None,
             start_balances: Dict[str, float] = None,
+            transactions: [MockTransaction] = None
     ):
         super().__init__(client, binance_cache, config, db, logger, BinanceOrderBalanceManager(logger, config, client, binance_cache))
         self.config = config
@@ -36,6 +38,7 @@ class MockBinanceManager(BinanceAPIManager):
         self.paid_fees = {}
         self.coins_trades= {}
         self.historic_kline_cache = HistoricKlineCache(client, logger)
+        self.transactions = transactions
 
     def now(self):
         return self.datetime.replace(tzinfo=timezone.utc)
@@ -116,7 +119,8 @@ class MockBinanceManager(BinanceAPIManager):
             lambda: None,
             order_price=from_coin_price,
             cumulative_quote_asset_transacted_quantity=0.0,
-            cumulative_filled_quantity=0.0,
+            cumulative_filled_quantity=round(self.balances[origin_symbol], 4),
+            transaction_time=self.datetime
         )
 
         session: Session
@@ -126,6 +130,11 @@ class MockBinanceManager(BinanceAPIManager):
             trade = Trade(from_coin, to_coin, False)
             trade.datetime = self.datetime
             trade.state = TradeState.COMPLETE
+            trade.alt_starting_balance = 0.0
+            trade.alt_trade_amount = round(self.balances[origin_symbol], 4)
+            trade.crypto_starting_balance = round(self.balances[origin_symbol], 4) * from_coin_price
+            trade.crypto_trade_amount = round(self.balances[origin_symbol], 4) * from_coin_price
+
             session.add(trade)
             # Flush so that SQLAlchemy fills in the id column
             session.flush()
@@ -154,6 +163,21 @@ class MockBinanceManager(BinanceAPIManager):
         self.logger.info(
             f"{self.datetime} Sold {origin_symbol} for {from_coin_price} {target_symbol}"
         )
+
+        with self.db.db_session() as session:
+            from_coin = session.merge(origin_coin)
+            to_coin = session.merge(target_coin)
+            trade = Trade(from_coin, to_coin, True)
+            trade.datetime = self.datetime
+            trade.state = TradeState.COMPLETE
+            trade.alt_starting_balance = order_quantity
+            trade.alt_trade_amount = order_quantity
+            trade.crypto_starting_balance = 0.0
+            trade.crypto_trade_amount = target_quantity
+            session.add(trade)
+            # Flush so that SQLAlchemy fills in the id column
+            session.flush()
+            self.db.send_update(trade)
         
         self.trades += 1
         return {"price": from_coin_price}
@@ -187,12 +211,39 @@ class MockBinanceManager(BinanceAPIManager):
             return None
         return round(((self.coins_trades[symbol][-1] - self.coins_trades[symbol][-2]) /self.coins_trades[symbol][-1] * 100 ),2)
 
+    def monitor_manual_transactions(self) -> [Dict]:
+
+        transactions = []
+        for transaction in self.transactions:
+            if self.datetime >= transaction.timestamp and not transaction.applied:
+                symbol = transaction.coin_id
+                if symbol in self.config.SUPPORTED_COIN_LIST:
+                    if not transaction.deposit and symbol not in self.balances.keys():
+                        continue
+                    self.logger.info(f"Found transaction: Symbol {symbol}")
+                    transactions.append(
+                        {
+                            "symbol": symbol,
+                            "cum_quantity": transaction.quantity,
+                            "cum_price": transaction.cum_price,
+                            "coin_price": transaction.cum_price / transaction.quantity if transaction.quantity > 0 else 0.0,
+                            "deposit": transaction.deposit,
+                        }
+                    )
+                    transaction_qty = transaction.quantity if transaction.deposit else - transaction.quantity
+                    new_amt = self.balances.get(symbol, 0) + transaction_qty
+                    self.balances[symbol] = new_amt if new_amt >= 0 else 0
+                    transaction.applied = True
+        return transactions
+
+
 class MockDatabase(Database):
     def __init__(self, logger: Logger, config: Config):
         super().__init__(logger, config, "sqlite:///data/crypto_trading.db.basktest", False)
 
     def log_scout(self, pair: Pair, target_ratio: float, current_coin_price: float, other_coin_price: float):
         pass
+
 
 def backtest(
         start_date: datetime = None,
@@ -202,6 +253,7 @@ def backtest(
         start_balances: Dict[str, float] = None,
         starting_coin: str = None,
         config: Config = None,
+        transactions: MockTransaction = None,
 ):
     """
 
@@ -230,13 +282,25 @@ def backtest(
         db, 
         logger,
         start_date,
-        start_balances
+        start_balances,
+        transactions,
     )
 
-    starting_coin = db.get_coin(starting_coin or config.CURRENT_COIN_SYMBOL or config.SUPPORTED_COIN_LIST[0])
-    if manager.get_currency_balance(starting_coin.symbol) == 0:
-        manager.buy_alt(starting_coin, config.BRIDGE, 0.0)  # doesn't matter mocking manager don't look at fixed price
-    db.set_current_coin(starting_coin)
+    db.mirgate_multiple_coin_pnl()
+    if start_balances is not None:
+        for coin, balance in start_balances.items():
+            if coin in config.SUPPORTED_COIN_LIST:
+                new_path = db.set_new_coin_path()
+                db.set_current_coin(coin, new_path)
+                db.set_coin_pnl(new_path, coin, balance, 0, 0, 0, 0, 0)
+    else:
+        starting_coins = [db.get_coin(starting_coin or config.CURRENT_COIN_SYMBOL or config.SUPPORTED_COIN_LIST[0])]
+        if manager.get_currency_balance(starting_coins[0].symbol) == 0:
+            manager.buy_alt(starting_coins[0], config.BRIDGE, 0.0)  # doesn't matter mocking manager don't look at fixed price
+            new_path = db.set_new_coin_path()
+            db.set_current_coin(starting_coins[0], new_path)
+            balance = manager.get_currency_balance(starting_coins[0])
+            db.set_coin_pnl(new_path, starting_coins[0], balance, 0, 0, 0, 0, 0)
 
     strategy = get_strategy(config.STRATEGY)
     if strategy is None:
