@@ -2,7 +2,7 @@ from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from math import log
 from traceback import format_exc
-from typing import Dict
+from typing import Dict, List
 from sqlalchemy.orm.session import Session
 from binance.client import Client
 
@@ -14,8 +14,11 @@ from .database import Database
 from .logger import Logger
 from .models import Coin, Pair, Trade, TradeState
 from .strategies import get_strategy
+from .mock_transaction import MockTransaction
 
-
+"""
+Backtest to be used by developers to test code - not for testing coin/strategy performance.
+"""
 class MockBinanceManager(BinanceAPIManager):
     def __init__(
             self,
@@ -26,9 +29,9 @@ class MockBinanceManager(BinanceAPIManager):
             logger: Logger,
             start_date: datetime = None,
             start_balances: Dict[str, float] = None,
+            transactions: [MockTransaction] = None,
     ):
-        super().__init__(client, binance_cache, config, db, logger,
-                         BinanceOrderBalanceManager(logger, config, client, binance_cache))
+        super().__init__(client, binance_cache, config, db, logger, BinanceOrderBalanceManager(logger, config, client, binance_cache))
         self.config = config
         self.datetime = start_date or datetime(2021, 1, 1)
         self.balances = start_balances or {config.BRIDGE.symbol: 100}
@@ -37,8 +40,9 @@ class MockBinanceManager(BinanceAPIManager):
         self.positve_coin_jumps = 0
         self.negative_coin_jumps = 0
         self.paid_fees = {}
-        self.coins_trades = {}
+        self.coins_trades= {}
         self.historic_kline_cache = HistoricKlineCache(client, logger)
+        self.transactions = transactions if transactions is not None else []
 
     def now(self):
         return self.datetime.replace(tzinfo=timezone.utc)
@@ -52,7 +56,7 @@ class MockBinanceManager(BinanceAPIManager):
     def get_fee(self, origin_coin: Coin, target_coin: Coin, selling: bool):
         if self.config.TRADE_FEE != "auto":
             return float(self.config.TRADE_FEE)
-
+            
         return 0.001
 
     def get_min_notional(self, origin_symbol: str, target_symbol: str):
@@ -112,12 +116,12 @@ class MockBinanceManager(BinanceAPIManager):
             diff_str = f"{diff} %"
 
         self.logger.info(
-            f"{self.datetime} Bought {origin_symbol} {round(self.balances[origin_symbol], 4)} for {from_coin_price} {target_symbol}. Gain: {diff_str}"
+            f"{self.datetime} Bought {origin_symbol} {round(order_quantity, 4)} for {from_coin_price} {target_symbol}. Total {round(order_quantity * from_coin_price, 4)} {target_symbol}. Gain: {diff_str}"
         )
-
+        
         if diff is not None:
             if diff > 0.0:
-                self.positve_coin_jumps += 1
+                self.positve_coin_jumps +=1
             else:
                 self.negative_coin_jumps += 1
 
@@ -125,7 +129,8 @@ class MockBinanceManager(BinanceAPIManager):
             lambda: None,
             order_price=from_coin_price,
             cumulative_quote_asset_transacted_quantity=0.0,
-            cumulative_filled_quantity=0.0,
+            cumulative_filled_quantity=round(order_quantity, 4),
+            transaction_time=self.datetime
         )
 
         session: Session
@@ -135,6 +140,11 @@ class MockBinanceManager(BinanceAPIManager):
             trade = Trade(from_coin, to_coin, False)
             trade.datetime = self.datetime
             trade.state = TradeState.COMPLETE
+            trade.alt_starting_balance = 0.0
+            trade.alt_trade_amount = order_quantity
+            trade.crypto_starting_balance = round(order_quantity * from_coin_price, 4)
+            trade.crypto_trade_amount = round(order_quantity * from_coin_price, 4)
+
             session.add(trade)
             # Flush so that SQLAlchemy fills in the id column
             session.flush()
@@ -164,13 +174,28 @@ class MockBinanceManager(BinanceAPIManager):
             f"{self.datetime} Sold {origin_symbol} for {from_coin_price} {target_symbol}"
         )
 
+        with self.db.db_session() as session:
+            from_coin = session.merge(origin_coin)
+            to_coin = session.merge(target_coin)
+            trade = Trade(from_coin, to_coin, True)
+            trade.datetime = self.datetime
+            trade.state = TradeState.COMPLETE
+            trade.alt_starting_balance = order_quantity
+            trade.alt_trade_amount = order_quantity
+            trade.crypto_starting_balance = 0.0
+            trade.crypto_trade_amount = target_quantity
+            session.add(trade)
+            # Flush so that SQLAlchemy fills in the id column
+            session.flush()
+            self.db.send_update(trade)
+        
         self.trades += 1
         return {"price": from_coin_price}
 
-    def collate_coins(self, target_symbol: str):
+    def collate_coins(self, target_symbol: str):      
         return self.collate(target_symbol, self.balances)
 
-    def collate_fees(self, target_symbol: str):
+    def collate_fees(self, target_symbol: str):        
         return self.collate(target_symbol, self.paid_fees)
 
     def collate(self, target_symbol: str, balances: dict):
@@ -190,23 +215,47 @@ class MockBinanceManager(BinanceAPIManager):
                     continue
                 total += price * balance
         return total
-
+    
     def get_diff(self, symbol):
         if len(self.coins_trades[symbol]) == 1:
             return None
-        return round(
-            ((self.coins_trades[symbol][-1] - self.coins_trades[symbol][-2]) / self.coins_trades[symbol][-1] * 100), 2)
+        return round(((self.coins_trades[symbol][-1] - self.coins_trades[symbol][-2]) /self.coins_trades[symbol][-1] * 100 ),2)
+
+    def monitor_manual_transactions(self) -> [Dict]:
+
+        transactions = []
+        for transaction in self.transactions:
+            if self.datetime >= transaction.timestamp and not transaction.applied:
+                symbol = transaction.coin_id
+                if symbol in self.config.SUPPORTED_COIN_LIST:
+                    if not transaction.deposit and symbol not in self.balances.keys():
+                        continue
+                    self.logger.info(f"Found transaction: Symbol {symbol}")
+                    transaction_qty = transaction.quantity if transaction.deposit else - transaction.quantity
+                    new_amt = self.balances.get(symbol, 0) + transaction_qty
+                    self.balances[symbol] = new_amt if new_amt >= 0 else 0
+                    transaction.applied = True
+
+                    coin = Coin(symbol)
+                    quantity = transaction.quantity
+                    price = self.get_ticker_price(symbol + self.config.BRIDGE.symbol)
+                    deposited = transaction.deposit
+                    transactions.append(self.db.set_manual_transaction(coin, quantity, price, deposited))
+                elif symbol == self.config.BRIDGE.symbol:
+                    self.balances[symbol] = transaction.quantity if transaction.quantity >= 0 else 0
+                    transaction.applied = True
+        return transactions
 
 
 class MockDatabase(Database):
     def __init__(self, logger: Logger, config: Config):
-        super().__init__(logger, config, "sqlite:///", True)
+        super().__init__(logger, config, "sqlite:///data/crypto_trading.db.basktest", False)
 
     def log_scout(self, pair: Pair, target_ratio: float, current_coin_price: float, other_coin_price: float):
         pass
 
 
-def backtest(
+def dev_backtest(
         start_date: datetime = None,
         end_date: datetime = None,
         interval=1,
@@ -214,9 +263,9 @@ def backtest(
         start_balances: Dict[str, float] = None,
         starting_coin: str = None,
         config: Config = None,
+        transactions=None,
 ):
     """
-
     :param config: Configuration object to use
     :param start_date: Date to  backtest from
     :param end_date: Date to backtest up to
@@ -224,9 +273,13 @@ def backtest(
     :param yield_interval: After how many intervals should the manager be yielded
     :param start_balances: A dictionary of initial coin values. Default: {BRIDGE: 100}
     :param starting_coin: The coin to start on. Default: first coin in coin list
+    :param transactions: Mocks manual deposits and withdrawals on Binance
 
     :return: The final coin balances
     """
+    if transactions is None:
+        transactions = []
+
     config = config or Config()
     logger = Logger("backtesting", enable_notifications=False)
 
@@ -235,20 +288,36 @@ def backtest(
     db = MockDatabase(logger, config)
     db.create_database()
     db.set_coins(config.SUPPORTED_COIN_LIST)
-    manager = MockBinanceManager(
+    manager = MockBinanceManager(        
         Client(config.BINANCE_API_KEY, config.BINANCE_API_SECRET_KEY, tld=config.BINANCE_TLD),
         BinanceCache(),
-        config,
-        db,
+        config, 
+        db, 
         logger,
         start_date,
-        start_balances
+        start_balances,
+        transactions,
     )
 
-    starting_coin = db.get_coin(starting_coin or config.CURRENT_COIN_SYMBOL or config.SUPPORTED_COIN_LIST[0])
-    if manager.get_currency_balance(starting_coin.symbol) == 0:
-        manager.buy_alt(starting_coin, config.BRIDGE, 0.0)  # doesn't matter mocking manager don't look at fixed price
-    db.set_current_coin(starting_coin)
+    db.mirgate_multiple_coin_pnl()
+    if start_balances is not None:
+        for coin, balance in start_balances.items():
+            if coin in config.SUPPORTED_COIN_LIST:
+                price = manager.get_ticker_price(coin + config.BRIDGE.symbol)
+                base_asset_precision = manager.get_base_asset_precision(coin, config.BRIDGE.symbol)
+                bridge_precision = manager.get_quote_asset_precision(coin, config.BRIDGE.symbol)
+                new_path = db.set_new_coin_path()
+                db.set_current_coin(coin, new_path)
+                db.set_coin_pnl(new_path, coin, balance, price, 0, 0, 0, 0, base_asset_precision, bridge_precision)
+    else:
+        starting_coins = [db.get_coin(starting_coin or config.CURRENT_COIN_SYMBOL or config.SUPPORTED_COIN_LIST[0])]
+        if manager.get_currency_balance(starting_coins[0].symbol) == 0:
+            result = manager.buy_alt(starting_coins[0], config.BRIDGE, 0.0)  # doesn't matter mocking manager don't look at fixed price
+            base_asset_precision = manager.get_base_asset_precision(starting_coins[0], config.BRIDGE.symbol)
+            bridge_precision = manager.get_quote_asset_precision(starting_coins[0], config.BRIDGE.symbol)
+            new_path = db.set_new_coin_path()
+            db.set_current_coin(starting_coins[0], new_path)
+            db.set_coin_pnl(new_path, starting_coins[0], result.cumulative_filled_quantity, result.price, 0, 0, 0, 0, base_asset_precision, bridge_precision)
 
     strategy = get_strategy(config.STRATEGY)
     if strategy is None:
@@ -269,6 +338,7 @@ def backtest(
             manager.increment(interval)
             if n % yield_interval == 0:
                 yield manager
+                trader.update_all_usd_pnl()
             n += 1
     except KeyboardInterrupt:
         pass

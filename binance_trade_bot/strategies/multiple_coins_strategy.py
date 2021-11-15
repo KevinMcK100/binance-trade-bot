@@ -1,5 +1,3 @@
-from datetime import datetime
-
 from binance_trade_bot.auto_trader import AutoTrader
 
 
@@ -102,13 +100,6 @@ class Strategy(AutoTrader):
                             to_coin = coin
                             price = self.manager.get_price(result)
                             path = self.manager.merge_paths(from_path, to_coin, result, price)
-                            # self.db.deactivate_path(old_path)
-                            # coin_pnl = self.db.get_last_coin_pnl(coin, old_path)
-                            # quantity = coin_pnl.coin_amount + result.cumulative_filled_quantity
-                            # coin_gain = coin_pnl.coin_gain
-                            # percent_gain = coin_pnl.percent_gain
-                            # total_coin_gain = coin_pnl.total_coin_gain
-                            # total_percent_gain = coin_pnl.total_percent_gain
                         else:
                             path = self.failed_buy_path
                             self.set_coin_pnl(coin, self.failed_buy_path, result.cumulative_filled_quantity, self.get_price(result))

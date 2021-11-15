@@ -1,14 +1,33 @@
 from datetime import datetime
 
-from binance_trade_bot import backtest
+from binance_trade_bot import dev_backtest
+from binance_trade_bot.mock_transaction import MockTransaction
 
+"""
+Dev Backtesting replicates the regular backtest. It is designed to test the code - not strategies and coin lists.
+It allows the developer to test various events/scenarios against the code during development.
+
+Additional functionality:
+ - Mock Transactions - Mimics DEPOSIT and WITHDRAWAL transactions manually performed by a user on Binance
+ - Starting Balances - Gives developer control over which coin(s) and quantities to start with
+ 
+NOTE: This backtest will have degraded performance over regular backtest so it is not recommended unless you need the 
+additional control it provides.
+"""
 if __name__ == "__main__":
     history = []
-    start_time = datetime(2021, 6, 1, 0, 0)
-    end_time = datetime(2021, 7, 1, 23, 59)
-    print(f"BACKTEST from {start_time} to {end_time}")
+    start_time = datetime(2021, 10, 28, 11, 0)
+    end_time = datetime(2021, 10, 29, 23, 30)
+    print(f"DEV BACKTEST from {start_time} to {end_time}")
+    deposit = MockTransaction("COMP", 10, 3000, True, datetime(2021, 10, 28, 18, 0))
+    deposit_bridge = MockTransaction("USDT", 10000, 10000, True, datetime(2021, 10, 29, 22, 30))
+    withdraw = MockTransaction("NEO", 1000, 50000, False, datetime(2021, 10, 28, 21, 0))
+    transactions = [deposit, deposit_bridge, withdraw]
+    for transaction in transactions:
+        print(f"ADDING TRANSACTION: {transaction.info()}")
     current_date = start_time.strftime("%d/%m/%Y")
-    for manager in backtest(start_time, end_time):
+    start_balances = {"BCH": 100, "LINK": 100}
+    for manager in dev_backtest(start_time, end_time, start_balances=start_balances, transactions=transactions):
         btc_value = manager.collate_coins("BTC")
         bridge_value = manager.collate_coins(manager.config.BRIDGE.symbol)
         btc_fees_value = manager.collate_fees("BTC")

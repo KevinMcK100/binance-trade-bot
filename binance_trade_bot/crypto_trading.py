@@ -62,6 +62,8 @@ def main():
     schedule.every(1).minutes.do(trader.update_values).tag("updating value history")
     schedule.every(1).minutes.do(db.prune_scout_history).tag("pruning scout history")
     schedule.every(1).hours.do(db.prune_value_history).tag("pruning value history")
+    schedule.every(1).minutes.do(trader.update_all_usd_pnl).tag("updating USD PNL")
+    schedule.every(1).days.do(db.prune_usd_pnl).tag("pruning USD PNL history")
     try:
         while True:
             schedule.run_pending()

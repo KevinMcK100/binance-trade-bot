@@ -7,12 +7,11 @@ import random, string
 from datetime import datetime, timezone
 from abc import ABC, abstractmethod
 from collections import defaultdict
-from typing import Callable, Dict, Optional
+from typing import Callable, Dict, Optional, List
 
 from binance.client import Client
 from binance.exceptions import BinanceAPIException
 from cachetools import TTLCache, cached
-from sqlalchemy.util.langhelpers import symbol
 
 from .binance_stream_manager import BinanceCache, BinanceOrder, BinanceStreamManager, OrderGuard
 from .config import Config
@@ -339,6 +338,14 @@ class BinanceAPIManager:
     def get_min_qty(self, origin_symbol: str, target_symbol: str):
         return float(self.get_symbol_filter(origin_symbol, target_symbol, "LOT_SIZE")["minQty"])
 
+    @cached(cache=TTLCache(maxsize=2000, ttl=43200))
+    def get_quote_asset_precision(self, origin_symbol: str, target_symbol: str):
+        return self.binance_client.get_symbol_info(origin_symbol + target_symbol)["quoteAssetPrecision"]
+
+    @cached(cache=TTLCache(maxsize=2000, ttl=43200))
+    def get_base_asset_precision(self, origin_symbol: str, target_symbol: str):
+        return self.binance_client.get_symbol_info(origin_symbol + target_symbol)["baseAssetPrecision"]
+
     def _wait_for_order(
         self, order_id, origin_symbol: str, target_symbol: str
     ) -> Optional[BinanceOrder]:  # pylint: disable=unsubscriptable-object
@@ -586,15 +593,6 @@ class BinanceAPIManager:
             return None  # skip selling below price from ratio
         #from_coin_price = max(from_coin_price, sell_price)
 
-        # If there is some bridge coin present when selling, assume it's a manual deposit.
-        trans_id = origin_symbol + target_symbol + str(target_balance)
-        min_notional = self.get_min_notional(origin_symbol, target_symbol)
-        if target_balance > min_notional and not self.cache.transactions[trans_id]:
-            self.db.set_manual_transaction("", target_symbol, target_balance, 1, True)
-            # Indicates this deposit has been recorded to avoid double counting in the event of retries
-            self.cache.transactions[trans_id] = True
-            # Update PNLs to reflect deposited amount
-
         trade_log = self.db.start_trade_log(origin_coin, target_coin, True)
 
         order_quantity = self._sell_quantity(origin_symbol, target_symbol, origin_balance)
@@ -642,31 +640,34 @@ class BinanceAPIManager:
         return order
 
     def monitor_manual_transactions(self):
+        """
+        Checks transaction cache for any new transactions manually executed by the user on Binance.
 
+        :return: list of transactions manually executed by user
+        """
+        transactions = []
         for order_id, already_processed in self.cache.transactions.items():
             if not already_processed:
                 order = self.cache.orders[order_id]
-                self.logger.info(f"Value: {order}")
                 base_asset = self.binance_client.get_symbol_info(order.symbol)["baseAsset"]
-                self.logger.info(f"Base asset: {base_asset}")
                 if base_asset in self.config.SUPPORTED_COIN_LIST:
-                    self.logger.info("Origin symbol is in supported coin list")
                     if order.status == Client.ORDER_STATUS_FILLED:
-                        self.logger.info("New transaction found")
+                        self.logger.info(f"Found new transaction for {base_asset}")
                         quantity = order.cumulative_filled_quantity
-                        price = order.cumulative_quote_qty
+                        price = self.get_ticker_price(base_asset + self.config.BRIDGE.symbol)
                         coin = Coin(base_asset)
                         deposited = False
                         if order.side == Client.SIDE_BUY:
-                            self.logger.info("Amount deposited.")
+                            self.logger.info(f"Amount deposited.")
                             deposited = True
                         else:
-                            self.logger.info("Amount withdrew.")
-                        self.db.set_manual_transaction(order.id, coin, quantity, price, deposited)
-                        self.logger.info(
-                            f"Symbol: {base_asset}, Quantity: {quantity}, Price: {price}, Client Order ID: {order.client_order_id}")
+                            self.logger.info(f"Amount withdrawn.")
+                        transactions.append(self.db.set_manual_transaction(coin, quantity, price, deposited))
+                        self.logger.info(f"Symbol: {base_asset}, Quantity: {quantity}, Price: {price} "
+                                         f"{self.config.BRIDGE.symbol}, Client Order ID: {order.client_order_id}")
                 # Indicates this deposit/withdrawal has been persisted to DB and should not be processed again
                 self.cache.transactions[order_id] = True
+        return transactions
 
 
 class PaperOrderBalanceManager(AbstractOrderBalanceManager):

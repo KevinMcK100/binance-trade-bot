@@ -44,7 +44,8 @@ class Config:  # pylint: disable=too-few-public-methods,too-many-instance-attrib
             "ratio_adjust_weight":"100",
             "auto_adjust_bnb_balance": "false",
             "auto_adjust_bnb_balance_rate": "3",
-            "allow_coin_merge": "true"
+            "allow_coin_merge": "true",
+            "daysToKeepUsdPnlHistory": "31",
         }
 
         if not os.path.exists(CFG_FL_NAME):
@@ -59,6 +60,10 @@ class Config:  # pylint: disable=too-few-public-methods,too-many-instance-attrib
         # Prune settings
         self.SCOUT_HISTORY_PRUNE_TIME = float(
             os.environ.get("HOURS_TO_KEEP_SCOUTING_HISTORY") or config.get(USER_CFG_SECTION, "hourToKeepScoutHistory")
+        )
+
+        self.USD_PNL_PRUNE_TIME = float(
+            os.environ.get("DAYS_TO_KEEP_USD_PNL_HISTORY") or config.get(USER_CFG_SECTION, "daysToKeepUsdPnlHistory")
         )
 
         # Get config for scout

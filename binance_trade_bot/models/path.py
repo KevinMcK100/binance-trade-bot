@@ -15,7 +15,6 @@ class Path(Base):  # pylint: disable=too-few-public-methods
     def __init__(self, active: bool):
         self.active = active
         self.datetime = datetime.utcnow()
-        print("Creating new path")
 
     def __repr__(self):
         return f"<{self.id}, {self.active}>"
