@@ -97,12 +97,14 @@ class Strategy(AutoTrader):
                         if coin.symbol in active_coin_symbols:
                             # update pnl for coin
                             from_path = self.failed_buy_path
-                            to_coin = coin
-                            price = self.manager.get_price(result)
-                            path = self.manager.merge_paths(from_path, to_coin, result, price)
+                            price = self.get_price(result)
+                            path = self.merge_paths(from_path, coin, result, price)
                         else:
                             path = self.failed_buy_path
-                            self.update_coin_pnl(coin, self.failed_buy_path, result.cumulative_filled_quantity, self.get_price(result))
+                            if path is None:
+                                path = self.get_coin_path(coin)
+                            self.update_coin_pnl(coin, path, result.cumulative_filled_quantity, self.get_price(result))
+                            self.update_usd_pnl(coin.symbol, path)
 
                         self.db.set_current_coin(coin, path)
                         self.failed_buy_order = False

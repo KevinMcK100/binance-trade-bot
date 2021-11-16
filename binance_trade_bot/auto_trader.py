@@ -425,7 +425,8 @@ class AutoTrader:
             usd_pnl = self.db.set_usd_pnl(path, usd_value, 0, 0, 0, 0)
         else:
             gain = round(usd_value - (last_pnl.value + tx_amt), 2)
-            percent_gain = round(gain / (last_pnl.value + tx_amt) * 100, 2)
+            prev_amount = last_pnl.value + tx_amt
+            percent_gain = round(gain / prev_amount * 100, 2) if prev_amount > 0 else 0
             total_gain = round(last_pnl.total_gain + gain, 2)
             total_percent_gain = round(last_pnl.total_percent_gain + percent_gain, 2)
             usd_pnl = self.db.set_usd_pnl(path, usd_value, gain, percent_gain, total_gain, total_percent_gain)
