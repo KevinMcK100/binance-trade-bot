@@ -102,7 +102,7 @@ class Strategy(AutoTrader):
                             path = self.manager.merge_paths(from_path, to_coin, result, price)
                         else:
                             path = self.failed_buy_path
-                            self.set_coin_pnl(coin, self.failed_buy_path, result.cumulative_filled_quantity, self.get_price(result))
+                            self.update_coin_pnl(coin, self.failed_buy_path, result.cumulative_filled_quantity, self.get_price(result))
 
                         self.db.set_current_coin(coin, path)
                         self.failed_buy_order = False
