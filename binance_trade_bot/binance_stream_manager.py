@@ -213,7 +213,7 @@ class BinanceStreamManager:
             order = BinanceOrder(stream_data)
             self.cache.orders[order.id] = order
             # assess for manual transaction
-            if not str(order.client_order_id).startswith("btb_") and not self.cache.transactions[order.id]:
+            if not str(order.client_order_id).startswith("btb_") and self.cache.transactions.get(order.id) is None:
                 self.logger.info("Setting transaction")
                 # Indicates that this order should be processed as a manual deposit/withdrawal transaction
                 self.cache.transactions[order.id] = False
